@@ -16,6 +16,7 @@ uploaded = st.sidebar.file_uploader("Upload Excel file (monthly data)", type=["x
 months_to_forecast = st.sidebar.number_input("Forecast months", min_value=1, max_value=24, value=12)
 alert_threshold_percent = st.sidebar.number_input("Alert threshold vs IMS (%)", min_value=10, max_value=500, value=150)
 
+
 def read_excel_bytes(bytes_io):
     # Read file (try single-sheet then all sheets)
     try:
@@ -64,12 +65,12 @@ def read_excel_bytes(bytes_io):
             df_clean = pd.DataFrame(parsed)
             df_clean["Month"] = pd.to_datetime(df_clean["Month"], errors="coerce")
             for c in ["Stock", "IMS", "Shipment"]:
-                # remove commas, empty strings then coerce numeric
                 df_clean[c] = pd.to_numeric(df_clean[c].astype(str).str.replace(",", "").replace("", "0"), errors="coerce").fillna(0)
             return df_clean
 
     # If not vertical, assume normal tabular layout: return trimmed headers
     return df
+
 
 def normalize_input(df):
     # Drop completely empty top rows and reset index
@@ -116,9 +117,9 @@ def normalize_input(df):
     result = df[keep].copy()
 
     # Debug: write detected columns and sample rows to the Streamlit sidebar
-st.sidebar.write("Parsed sample (first 10 rows):")
-st.sidebar.dataframe(result.head(10))
-st.sidebar.write("Detected columns:", list(result.columns))
+    st.sidebar.write("Parsed sample (first 10 rows):")
+    st.sidebar.dataframe(result.head(10))
+    st.sidebar.write("Detected columns:", list(result.columns))
 
     # Safety guard: clear message if SKU missing after normalization
     if "SKU" not in result.columns:
@@ -126,6 +127,7 @@ st.sidebar.write("Detected columns:", list(result.columns))
         st.stop()
 
     return result
+
 
 def compute_forecast_per_sku(sku_df, months=12):
     sku_df = sku_df.sort_values("Month").set_index("Month").copy()
@@ -171,6 +173,7 @@ def compute_forecast_per_sku(sku_df, months=12):
     })
     return out, sku_df
 
+
 def highlight_alerts(forecast_df, last_ims):
     alerts = []
     for idx, row in forecast_df.iterrows():
@@ -180,6 +183,7 @@ def highlight_alerts(forecast_df, last_ims):
         if row["Forecasted_Shipment"] > thresh:
             alerts.append((sku, row["Month"].strftime("%Y-%m"), row["Forecasted_Shipment"], ims))
     return alerts
+
 
 if uploaded is None:
     st.info("Upload your Excel file in the left panel. Required (or auto-detected) columns: Month, SKU, Stock, IMS, Shipment.")
@@ -196,6 +200,11 @@ if df.empty:
 st.subheader("Preview data (first 10 rows)")
 st.dataframe(df.head(10))
 
+# safety check before accessing SKU
+if "SKU" not in df.columns:
+    st.error("No SKU column found. Detected columns: " + ", ".join(list(df.columns)))
+    st.stop()
+
 skus = df["SKU"].unique()
 st.sidebar.subheader("Select SKU for detailed view")
 sel_sku = st.sidebar.selectbox("SKU", options=skus)
@@ -211,7 +220,7 @@ for sku in skus:
     fc, hist = compute_forecast_per_sku(sku_df, months=months_to_forecast)
     all_forecasts.append(fc)
     sku_histories[sku] = hist
-    if len(hist["IMS"].dropna())>0:
+    if len(hist["IMS"].dropna()) > 0:
         last_ims[sku] = hist["IMS"].dropna().iloc[-1]
     else:
         last_ims[sku] = 0
@@ -239,11 +248,13 @@ with st.expander("Download / Manual override", expanded=True):
 
 st.dataframe(forecast_all.sort_values(["SKU", "Month"]).reset_index(drop=True))
 
+
 def to_excel_bytes(df_out):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df_out.to_excel(writer, index=False, sheet_name="Forecast")
     return buf.getvalue()
+
 
 excel_bytes = to_excel_bytes(forecast_all)
 b64 = base64.b64encode(excel_bytes).decode()
@@ -261,9 +272,9 @@ else:
 
 st.subheader(f"SKU details — {sel_sku}")
 hist = sku_histories[sel_sku]
-hist = hist.reset_index().rename(columns={"index":"Month"})
+hist = hist.reset_index().rename(columns={"index": "Month"})
 hist["Month"] = pd.to_datetime(hist["Month"])
-fc_sku = forecast_all[forecast_all["SKU"]==sel_sku].copy()
+fc_sku = forecast_all[forecast_all["SKU"] == sel_sku].copy()
 fc_sku["Month"] = pd.to_datetime(fc_sku["Month"])
 
 fig = go.Figure()
