@@ -72,12 +72,8 @@ def read_excel_bytes(bytes_io):
     return df
 
 def normalize_input(df):
-    st.sidebar.write("Parsed sample (first 10 rows):")
-st.sidebar.dataframe(df.head(10))
-st.sidebar.write("Detected columns:", list(df.columns))
     # Drop completely empty top rows and reset index
     df = df.copy()
-    # drop rows where all cells are NaN
     df = df.dropna(how="all").reset_index(drop=True)
 
     # Build lowercase->original mapping of column names
@@ -86,7 +82,7 @@ st.sidebar.write("Detected columns:", list(df.columns))
     # Attempt to match required fields case-insensitively and with common variants
     wanted = {
         "month": ["month", "date", "period"],
-        "sku": ["sku", "product", "item", "code"],
+        "sku": ["sku", "product", "item", "code", "description"],
         "stock": ["stock", "onhand", "inventory"],
         "ims": ["ims", "on invoice", "onmarket", "available"],
         "shipment": ["shipment", "shipments", "shipped", "sales"]
@@ -119,8 +115,15 @@ st.sidebar.write("Detected columns:", list(df.columns))
     keep = [c for c in ["Month", "SKU", "Stock", "IMS", "Shipment"] if c in df.columns]
     result = df[keep].copy()
 
-    # Debug: write detected columns to the Streamlit app so you can see what was found
-    st.sidebar.write("Detected columns:", list(result.columns))
+    # Debug: write detected columns and sample rows to the Streamlit sidebar
+st.sidebar.write("Parsed sample (first 10 rows):")
+st.sidebar.dataframe(result.head(10))
+st.sidebar.write("Detected columns:", list(result.columns))
+
+    # Safety guard: clear message if SKU missing after normalization
+    if "SKU" not in result.columns:
+        st.error("No SKU column detected after parsing. Detected: " + ", ".join(list(result.columns)))
+        st.stop()
 
     return result
 
