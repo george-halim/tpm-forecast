@@ -29,23 +29,54 @@ def read_excel_bytes(bytes_io):
         return pd.concat(sheets, ignore_index=True)
 
 def normalize_input(df):
-    cols = {c.lower(): c for c in df.columns}
-    match = {}
-    for target in ["month", "sku", "stock", "ims", "shipment"]:
-        if target in cols:
-            match[target] = cols[target]
-    if "sku" not in match:
-        df = df.copy()
+    # Drop completely empty top rows and reset index
+    df = df.copy()
+    # drop rows where all cells are NaN
+    df = df.dropna(how="all").reset_index(drop=True)
+
+    # Build lowercase->original mapping of column names
+    cols = {str(c).strip().lower(): c for c in df.columns}
+
+    # Attempt to match required fields case-insensitively and with common variants
+    wanted = {
+        "month": ["month", "date", "period"],
+        "sku": ["sku", "product", "item", "code"],
+        "stock": ["stock", "onhand", "inventory"],
+        "ims": ["ims", "on invoice", "onmarket", "available"],
+        "shipment": ["shipment", "shipments", "shipped", "sales"]
+    }
+
+    found = {}
+    for key, variants in wanted.items():
+        for v in variants:
+            if v in cols:
+                found[key] = cols[v]
+                break
+
+    # If Month found, convert to datetime
+    if "month" in found:
+        df[found["month"]] = pd.to_datetime(df[found["month"]], errors="coerce")
+
+    # If SKU not found, create a default SKU column
+    if "sku" not in found:
         df["SKU"] = "SKU_1"
-        match["sku"] = "SKU"
+        found["sku"] = "SKU"
+
+    # Rename the detected columns to canonical names
     rename_map = {}
-    for k, v in match.items():
-        rename_map[v] = k.capitalize()
+    for k, orig in found.items():
+        rename_map[orig] = k.capitalize()
+
     df = df.rename(columns=rename_map)
-    if "Month" in df.columns:
-        df["Month"] = pd.to_datetime(df["Month"], errors="coerce")
+
+    # Keep only relevant columns if present
     keep = [c for c in ["Month", "SKU", "Stock", "IMS", "Shipment"] if c in df.columns]
-    return df[keep]
+    result = df[keep].copy()
+
+    # Debug: write detected columns to the Streamlit app so you can see what was found
+    st.sidebar.write("Detected columns:", list(result.columns))
+
+    return result
 
 def compute_forecast_per_sku(sku_df, months=12):
     sku_df = sku_df.sort_values("Month").set_index("Month").copy()
