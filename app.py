@@ -9,125 +9,213 @@ from statsmodels.tsa.seasonal import seasonal_decompose
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="Shipment Forecast Agent", layout="wide")
-st.title("Shipment Forecast Agent — Monthly, Multi‑SKU, Seasonality, Overrides")
+st.title("Shipment Forecast Agent — Monthly, Multi‑SKU, Auto-parse")
 
 st.sidebar.header("Upload / Settings")
 uploaded = st.sidebar.file_uploader("Upload Excel file (monthly data)", type=["xlsx", "xls"])
 months_to_forecast = st.sidebar.number_input("Forecast months", min_value=1, max_value=24, value=12)
 alert_threshold_percent = st.sidebar.number_input("Alert threshold vs IMS (%)", min_value=10, max_value=500, value=150)
 
-
 def read_excel_bytes(bytes_io):
-    # Read file (try single-sheet then all sheets)
+    # Try reading first as normal table; if it looks vertical, return as-is for normalize_input to handle
     try:
-        df = pd.read_excel(bytes_io)
-    except Exception:
         xls = pd.ExcelFile(bytes_io)
         sheets = []
         for name in xls.sheet_names:
-            s = pd.read_excel(xls, sheet_name=name)
+            s = pd.read_excel(xls, sheet_name=name, header=None)
+            # keep as no-header so we can detect vertical patterns
+            s["_sheet_name"] = name
             sheets.append(s)
-        df = pd.concat(sheets, ignore_index=True)
+        df_raw = pd.concat(sheets, ignore_index=True, sort=False)
+        df_raw = df_raw.dropna(how="all").reset_index(drop=True)
+        return df_raw
+    except Exception:
+        # fallback
+        try:
+            df = pd.read_excel(bytes_io, header=None)
+            df = df.dropna(how="all").reset_index(drop=True)
+            return df
+        except Exception:
+            return pd.DataFrame()
 
-    # Drop fully empty top rows and reset index
-    df = df.dropna(how="all").reset_index(drop=True)
+def try_transpose_vertical_block(df):
+    # If the incoming df has a single non-empty column (vertical blocks), transform into rows
+    # Strategy: read the first column as a list of items; find repeating pattern of header labels then chunk
+    if df.shape[1] == 0:
+        return pd.DataFrame()
+    # collapse to first meaningful column that contains labels/values
+    first_cols = [c for c in df.columns if c != "_sheet_name"]
+    if not first_cols:
+        return pd.DataFrame()
+    col0 = first_cols[0]
+    items = df[col0].astype(str).map(lambda x: x.strip()).tolist()
+    # remove empty lines
+    items = [i for i in items if i and i.lower() != "nan"]
+    # detect if items contain header labels vertically
+    lower_items = [i.lower() for i in items]
+    header_labels = ["month", "sku", "stock", "ims", "shipment", "shipments", "onhand", "inventory"]
+    header_hits = sum(1 for it in lower_items[:40] if any(h in it for h in header_labels))
+    # if low hits but columns >1 we may already be tabular; only proceed if hits >=2 or original had 1 column
+    if header_hits < 2 and df.shape[1] > 1:
+        # try reading as normal table with first non-empty row as header
+        # find the first row where a known header appears across the row
+        for rid in range(min(6, df.shape[0])):
+            rowvals = df.iloc[rid].astype(str).str.strip().str.lower().tolist()
+            if any(h in " ".join(rowvals) for h in header_labels):
+                # treat this row as header
+                header = df.iloc[rid].astype(str).str.strip().tolist()
+                tab = df.iloc[rid+1:].copy().reset_index(drop=True)
+                tab.columns = header
+                return tab
+        return pd.DataFrame()  # give up here and let normalize_input try other heuristics
 
-    # Normalize column names
-    df.columns = [str(c).strip() for c in df.columns]
+    # Now parse items: find first index where "month" occurs
+    start_idx = 0
+    for i, it in enumerate(lower_items):
+        if it.startswith("month"):
+            start_idx = i
+            break
+    items = items[start_idx:]
+    # We expect sequence: Month, SKU, Stock, IMS, Shipment repeated. Use chunk size 5
+    chunk = 5
+    rows = []
+    i = 0
+    while i + chunk - 1 < len(items):
+        block = items[i:i+chunk]
+        # basic sanity: block[0] should look like a date or year
+        rows.append(block)
+        i += chunk
+    if not rows:
+        return pd.DataFrame()
+    # Create DataFrame from rows
+    dfn = pd.DataFrame(rows, columns=["Month", "SKU", "Stock", "IMS", "Shipment"])
+    return dfn
 
-    # Detect strong vertical layout: many header keywords in first column
-    first_col = df.columns[0]
-    col0_vals = df[first_col].astype(str).str.strip().str.lower().tolist()
-    header_keywords = {"month", "sku", "stock", "ims", "shipment", "shipments", "onhand", "inventory"}
-    hits = sum(1 for v in col0_vals[:30] if any(k in v for k in header_keywords))
-
-    if hits >= 3:
-        # Parse vertical blocks: read non-empty values from first column and chunk by 5
-        items = [x for x in df[first_col].astype(str).tolist() if str(x).strip() != ""]
-        # Find first 'month' label position and start there
-        start = 0
-        for i, it in enumerate(items):
-            if it.strip().lower().startswith("month"):
-                start = i
+def normalize_input(df_raw):
+    # df_raw may be headerless (from read_excel_bytes)
+    # If df_raw looks like a regular table (has multiple columns with header-like first row), try that first
+    # If df_raw has column names like 0,1,2... and first row includes Month etc, use it
+    if df_raw.empty:
+        return pd.DataFrame()
+    # If df_raw has many columns, check for header row
+    if df_raw.shape[1] > 3:
+        # find candidate header row (first row that contains 'month' or 'sku')
+        header_row = None
+        for r in range(min(6, df_raw.shape[0])):
+            rowvals = df_raw.iloc[r].astype(str).str.strip().str.lower().tolist()
+            if any("month" == v or "month" in v for v in rowvals) and any("sku" == v or "sku" in v for v in rowvals):
+                header_row = r
                 break
-        items = items[start:]
-        parsed = []
-        i = 0
-        while i + 4 < len(items):
-            m = items[i].strip()
-            sku = items[i + 1].strip()
-            stock = items[i + 2].strip()
-            ims = items[i + 3].strip()
-            shipment = items[i + 4].strip()
-            parsed.append({"Month": m, "SKU": sku, "Stock": stock, "IMS": ims, "Shipment": shipment})
-            i += 5
-        if len(parsed) >= 1:
-            df_clean = pd.DataFrame(parsed)
-            df_clean["Month"] = pd.to_datetime(df_clean["Month"], errors="coerce")
-            for c in ["Stock", "IMS", "Shipment"]:
-                df_clean[c] = pd.to_numeric(df_clean[c].astype(str).str.replace(",", "").replace("", "0"), errors="coerce").fillna(0)
-            return df_clean
+        if header_row is not None:
+            header = df_raw.iloc[header_row].astype(str).str.strip().tolist()
+            df_tab = df_raw.iloc[header_row+1:].copy().reset_index(drop=True)
+            df_tab.columns = header
+        else:
+            # attempt transpose-based parsing if first column looks like headers vertically
+            df_tab = try_transpose_vertical_block(df_raw)
+            if df_tab.empty:
+                # fallback: treat df_raw as having header at row 0
+                df_tab = df_raw.copy()
+                df_tab.columns = [str(c).strip() for c in df_tab.iloc[0].astype(str).tolist()]
+                df_tab = df_tab.iloc[1:].reset_index(drop=True)
+    else:
+        # few columns: likely vertical block format; try transpose
+        df_tab = try_transpose_vertical_block(df_raw)
+        if df_tab.empty:
+            # fallback: try to interpret first row as header
+            df_tab = df_raw.copy()
+            df_tab.columns = [str(c).strip() for c in df_tab.iloc[0].astype(str).tolist()]
+            df_tab = df_tab.iloc[1:].reset_index(drop=True)
 
-    # If not vertical, assume normal tabular layout: return trimmed headers
-    return df
+    # Trim column names
+    df_tab.columns = [str(c).strip() for c in df_tab.columns]
 
+    # Normalize known names to canonical
+    cols_map = {c.lower(): c for c in df_tab.columns}
+    mapping = {}
+    def find_col(possible):
+        for p in possible:
+            if p in cols_map:
+                return cols_map[p]
+        return None
 
-def normalize_input(df):
-    # Drop completely empty top rows and reset index
-    df = df.copy()
-    df = df.dropna(how="all").reset_index(drop=True)
+    month_col = find_col(["month", "date", "period"])
+    sku_col = find_col(["sku", "product", "item", "code", "description"])
+    stock_col = find_col(["stock", "onhand", "inventory"])
+    ims_col = find_col(["ims", "on invoice", "onmarket", "available"])
+    ship_col = find_col(["shipment", "shipments", "shipped", "sales"])
 
-    # Build lowercase->original mapping of column names
-    cols = {str(c).strip().lower(): c for c in df.columns}
+    # If file contains vertical repetition but no SKU header, try assuming columns order Month, SKU, Stock, IMS, Shipment
+    if month_col is None and set(map(str.lower, df_tab.columns)).issubset({str(i) for i in range(df_tab.shape[1])}):
+        # numeric-named columns -> assume canonical order if count==5
+        if df_tab.shape[1] >= 5:
+            df_tab.columns = ["Month", "SKU", "Stock", "IMS", "Shipment"] + list(df_tab.columns[5:])
+            month_col, sku_col, stock_col, ims_col, ship_col = "Month", "SKU", "Stock", "IMS", "Shipment"
 
-    # Attempt to match required fields case-insensitively and with common variants
-    wanted = {
-        "month": ["month", "date", "period"],
-        "sku": ["sku", "product", "item", "code", "description"],
-        "stock": ["stock", "onhand", "inventory"],
-        "ims": ["ims", "on invoice", "onmarket", "available"],
-        "shipment": ["shipment", "shipments", "shipped", "sales"]
-    }
-
-    found = {}
-    for key, variants in wanted.items():
-        for v in variants:
-            if v in cols:
-                found[key] = cols[v]
-                break
-
-    # If Month found, convert to datetime
-    if "month" in found:
-        df[found["month"]] = pd.to_datetime(df[found["month"]], errors="coerce")
-
-    # If SKU not found, create a default SKU column
-    if "sku" not in found:
-        df["SKU"] = "SKU_1"
-        found["sku"] = "SKU"
-
-    # Rename the detected columns to canonical names
+    # Rename found columns to canonical names
     rename_map = {}
-    for k, orig in found.items():
-        rename_map[orig] = k.capitalize()
+    if month_col:
+        rename_map[month_col] = "Month"
+    if sku_col:
+        rename_map[sku_col] = "SKU"
+    if stock_col:
+        rename_map[stock_col] = "Stock"
+    if ims_col:
+        rename_map[ims_col] = "IMS"
+    if ship_col:
+        rename_map[ship_col] = "Shipment"
 
-    df = df.rename(columns=rename_map)
+    df_tab = df_tab.rename(columns=rename_map)
 
-    # Keep only relevant columns if present
-    keep = [c for c in ["Month", "SKU", "Stock", "IMS", "Shipment"] if c in df.columns]
-    result = df[keep].copy()
+    # If SKU column missing but there is a column with many non-numeric repeated strings, use that
+    if "SKU" not in df_tab.columns:
+        candidate = None
+        for c in df_tab.columns:
+            s = df_tab[c].astype(str).str.strip()
+            nonnum_pct = (~s.str.match(r'^[\d\.\-\/]+$')).mean()
+            uniq = s.nunique(dropna=True)
+            if nonnum_pct > 0.5 and uniq < len(s) * 0.95:
+                candidate = c
+                break
+        if candidate:
+            df_tab = df_tab.rename(columns={candidate: "SKU"})
+    # If still no SKU, create default
+    if "SKU" not in df_tab.columns:
+        df_tab["SKU"] = "SKU_1"
 
-    # Debug: write detected columns and sample rows to the Streamlit sidebar
-    st.sidebar.write("Parsed sample (first 10 rows):")
-    st.sidebar.dataframe(result.head(10))
-    st.sidebar.write("Detected columns:", list(result.columns))
+    # Fill down SKU
+    df_tab["SKU"] = df_tab["SKU"].replace("", np.nan).ffill().fillna("SKU_1")
 
-    # Safety guard: clear message if SKU missing after normalization
-    if "SKU" not in result.columns:
-        st.error("No SKU column detected after parsing. Detected: " + ", ".join(list(result.columns)))
-        st.stop()
+    # Clean Month
+    if "Month" in df_tab.columns:
+        df_tab["Month"] = pd.to_datetime(df_tab["Month"], errors="coerce")
+        # if month looks like day-level and not first-of-month, set to first of month
+        if df_tab["Month"].notna().any():
+            df_tab["Month"] = df_tab["Month"].dt.to_period("M").dt.to_timestamp()
 
-    return result
+    # Clean numeric cols
+    for c in ["Stock", "IMS", "Shipment"]:
+        if c in df_tab.columns:
+            # remove commas and coerce
+            df_tab[c] = df_tab[c].astype(str).str.replace(",", "").str.replace(" ", "")
+            df_tab[c] = pd.to_numeric(df_tab[c].replace("", "0"), errors="coerce").fillna(0)
+        else:
+            df_tab[c] = 0
 
+    # Keep only canonical columns (safe order)
+    keep = ["Month", "SKU", "Stock", "IMS", "Shipment"]
+    df_out = df_tab[[c for c in keep if c in df_tab.columns]].copy()
+
+    # Final cleanup: drop rows where Month is NaT and all numeric columns zero (likely header artifacts)
+    df_out = df_out[~((df_out.get("Month").isna()) & (df_out[["Stock", "IMS", "Shipment"]].sum(axis=1) == 0))]
+    df_out = df_out.reset_index(drop=True)
+
+    # Debug info in sidebar
+    st.sidebar.write("Parsed sample (first 12 rows):")
+    st.sidebar.dataframe(df_out.head(12))
+    st.sidebar.write("Detected columns:", list(df_out.columns))
+
+    return df_out
 
 def compute_forecast_per_sku(sku_df, months=12):
     sku_df = sku_df.sort_values("Month").set_index("Month").copy()
@@ -173,7 +261,6 @@ def compute_forecast_per_sku(sku_df, months=12):
     })
     return out, sku_df
 
-
 def highlight_alerts(forecast_df, last_ims):
     alerts = []
     for idx, row in forecast_df.iterrows():
@@ -184,17 +271,16 @@ def highlight_alerts(forecast_df, last_ims):
             alerts.append((sku, row["Month"].strftime("%Y-%m"), row["Forecasted_Shipment"], ims))
     return alerts
 
-
 if uploaded is None:
-    st.info("Upload your Excel file in the left panel. Required (or auto-detected) columns: Month, SKU, Stock, IMS, Shipment.")
+    st.info("Upload your Excel file in the left panel. The app will try to auto-parse vertical or tabular layouts.")
     st.stop()
 
 raw_bytes = uploaded.read()
 df_raw = read_excel_bytes(io.BytesIO(raw_bytes))
 df = normalize_input(df_raw)
 
-if df.empty:
-    st.error("Uploaded file could not be parsed or contains no usable data.")
+if df.empty or "SKU" not in df.columns:
+    st.error("Uploaded file could not be parsed into Month, SKU, Stock, IMS, Shipment. Check your file or try again.")
     st.stop()
 
 st.subheader("Preview data (first 10 rows)")
@@ -248,13 +334,11 @@ with st.expander("Download / Manual override", expanded=True):
 
 st.dataframe(forecast_all.sort_values(["SKU", "Month"]).reset_index(drop=True))
 
-
 def to_excel_bytes(df_out):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df_out.to_excel(writer, index=False, sheet_name="Forecast")
     return buf.getvalue()
-
 
 excel_bytes = to_excel_bytes(forecast_all)
 b64 = base64.b64encode(excel_bytes).decode()
