@@ -17,18 +17,64 @@ months_to_forecast = st.sidebar.number_input("Forecast months", min_value=1, max
 alert_threshold_percent = st.sidebar.number_input("Alert threshold vs IMS (%)", min_value=10, max_value=500, value=150)
 
 def read_excel_bytes(bytes_io):
+    # Read file (try single-sheet then all sheets)
     try:
         df = pd.read_excel(bytes_io)
-        return df
     except Exception:
         xls = pd.ExcelFile(bytes_io)
         sheets = []
         for name in xls.sheet_names:
             s = pd.read_excel(xls, sheet_name=name)
             sheets.append(s)
-        return pd.concat(sheets, ignore_index=True)
+        df = pd.concat(sheets, ignore_index=True)
+
+    # Drop fully empty top rows and reset index
+    df = df.dropna(how="all").reset_index(drop=True)
+
+    # Normalize column names
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Detect strong vertical layout: many header keywords in first column
+    first_col = df.columns[0]
+    col0_vals = df[first_col].astype(str).str.strip().str.lower().tolist()
+    header_keywords = {"month", "sku", "stock", "ims", "shipment", "shipments", "onhand", "inventory"}
+    hits = sum(1 for v in col0_vals[:30] if any(k in v for k in header_keywords))
+
+    if hits >= 3:
+        # Parse vertical blocks: read non-empty values from first column and chunk by 5
+        items = [x for x in df[first_col].astype(str).tolist() if str(x).strip() != ""]
+        # Find first 'month' label position and start there
+        start = 0
+        for i, it in enumerate(items):
+            if it.strip().lower().startswith("month"):
+                start = i
+                break
+        items = items[start:]
+        parsed = []
+        i = 0
+        while i + 4 < len(items):
+            m = items[i].strip()
+            sku = items[i + 1].strip()
+            stock = items[i + 2].strip()
+            ims = items[i + 3].strip()
+            shipment = items[i + 4].strip()
+            parsed.append({"Month": m, "SKU": sku, "Stock": stock, "IMS": ims, "Shipment": shipment})
+            i += 5
+        if len(parsed) >= 1:
+            df_clean = pd.DataFrame(parsed)
+            df_clean["Month"] = pd.to_datetime(df_clean["Month"], errors="coerce")
+            for c in ["Stock", "IMS", "Shipment"]:
+                # remove commas, empty strings then coerce numeric
+                df_clean[c] = pd.to_numeric(df_clean[c].astype(str).str.replace(",", "").replace("", "0"), errors="coerce").fillna(0)
+            return df_clean
+
+    # If not vertical, assume normal tabular layout: return trimmed headers
+    return df
 
 def normalize_input(df):
+    st.sidebar.write("Parsed sample (first 10 rows):")
+st.sidebar.dataframe(df.head(10))
+st.sidebar.write("Detected columns:", list(df.columns))
     # Drop completely empty top rows and reset index
     df = df.copy()
     # drop rows where all cells are NaN
